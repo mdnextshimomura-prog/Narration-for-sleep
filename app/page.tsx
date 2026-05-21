@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import NameInput from "@/components/NameInput";
+import ReviewPanel from "@/components/ReviewPanel";
 import {
   loadAll,
   saveNarration,
@@ -11,7 +12,22 @@ import {
   setLastName,
 } from "@/lib/storage";
 import { ERROR_MARKER, TARGET_CHARS, RETRY_DELAY_SECONDS } from "@/lib/constants";
-import type { ErrorCode, SavedNarration } from "@/types";
+import type {
+  ErrorCode,
+  ReviewCandidate,
+  ReviewEvent,
+  ReviewStage,
+  ReviewSummary,
+  SavedNarration,
+  StageStatus,
+} from "@/types";
+
+const IDLE_STAGES: Record<ReviewStage, StageStatus> = {
+  compliance: "idle",
+  proofread: "idle",
+  ruby: "idle",
+  editor: "idle",
+};
 
 class AppError extends Error {
   code: ErrorCode;
@@ -54,10 +70,24 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [retryIn, setRetryIn] = useState(0);
 
+  // 校閲パイプライン関連
+  const [reviewing, setReviewing] = useState(false);
+  const [reviewStatus, setReviewStatus] =
+    useState<Record<ReviewStage, StageStatus>>(IDLE_STAGES);
+  const [reviewCounts, setReviewCounts] = useState<
+    Partial<Record<ReviewStage, number>>
+  >({});
+  const [candidates, setCandidates] = useState<ReviewCandidate[] | null>(null);
+  const [reviewSummary, setReviewSummary] = useState<ReviewSummary | null>(null);
+  const [approvedIds, setApprovedIds] = useState<Set<string>>(new Set());
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [appliedMessage, setAppliedMessage] = useState<string | null>(null);
+
   const abortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number>(0);
   const retryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reviewAbortRef = useRef<AbortController | null>(null);
 
   // 初回マウント時に履歴と最後の生成結果を復元する。
   useEffect(() => {
@@ -93,15 +123,110 @@ export default function Home() {
     setRetryIn(0);
   }, []);
 
+  // 校閲パイプライン（②〜⑤）を実行する。NDJSON で進捗を受け取る。
+  const startReview = useCallback(async (reviewText: string) => {
+    if (!reviewText || reviewText.trim().length < 50) return;
+    reviewAbortRef.current?.abort();
+    const controller = new AbortController();
+    reviewAbortRef.current = controller;
+
+    setReviewError(null);
+    setAppliedMessage(null);
+    setCandidates(null);
+    setReviewSummary(null);
+    setReviewCounts({});
+    setApprovedIds(new Set());
+    setReviewStatus({
+      compliance: "running",
+      proofread: "running",
+      ruby: "running",
+      editor: "idle",
+    });
+    setReviewing(true);
+
+    try {
+      const response = await fetch("/api/review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: reviewText }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        const code: ErrorCode = data?.error === "MISSING_API_KEY" ? "AUTH" : "UNKNOWN";
+        throw new AppError(code, messageForCode(code));
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new AppError("UNKNOWN", messageForCode("UNKNOWN"));
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let newlineIndex: number;
+        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          if (!line) continue;
+          const event = JSON.parse(line) as ReviewEvent;
+
+          if (event.type === "stage_start") {
+            setReviewStatus((prev) => ({ ...prev, [event.stage]: "running" }));
+          } else if (event.type === "stage_done") {
+            setReviewStatus((prev) => ({ ...prev, [event.stage]: "done" }));
+            setReviewCounts((prev) => ({ ...prev, [event.stage]: event.issueCount }));
+          } else if (event.type === "result") {
+            setCandidates(event.candidates);
+            setReviewSummary(event.summary);
+            setApprovedIds(
+              new Set(
+                event.candidates.filter((c) => c.applicable).map((c) => c.id),
+              ),
+            );
+          } else if (event.type === "error") {
+            throw new AppError(event.code, messageForCode(event.code));
+          }
+        }
+      }
+    } catch (err) {
+      if (
+        (err instanceof DOMException && err.name === "AbortError") ||
+        controller.signal.aborted
+      ) {
+        // ユーザー操作による中断。エラー表示は出さない。
+      } else if (err instanceof AppError) {
+        setReviewError(err.message);
+      } else {
+        setReviewError(messageForCode("NETWORK"));
+      }
+    } finally {
+      setReviewing(false);
+      reviewAbortRef.current = null;
+    }
+  }, []);
+
   const runGeneration = useCallback(
     async (targetName: string) => {
       cancelRetry();
+      reviewAbortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
 
       setError(null);
       setText("");
       setIsComplete(false);
+      setReviewing(false);
+      setReviewStatus(IDLE_STAGES);
+      setReviewCounts({});
+      setCandidates(null);
+      setReviewSummary(null);
+      setApprovedIds(new Set());
+      setReviewError(null);
+      setAppliedMessage(null);
       setIsGenerating(true);
       setCurrentName(targetName);
       setElapsedSeconds(0);
@@ -169,6 +294,9 @@ export default function Home() {
         const updated = saveNarration(narration);
         setLastName(targetName);
         setSavedList(updated);
+
+        // 生成完了後、検査パイプラインを自動で連続実行する。
+        startReview(full);
       } catch (err) {
         if (
           (err instanceof DOMException && err.name === "AbortError") ||
@@ -192,7 +320,7 @@ export default function Home() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [cancelRetry, stopTimer],
+    [cancelRetry, stopTimer, startReview],
   );
 
   // レート制限時に一定時間後へ自動再試行をスケジュールする。
@@ -249,9 +377,22 @@ export default function Home() {
     await generateDocx(currentName, text);
   }
 
+  function resetReview() {
+    reviewAbortRef.current?.abort();
+    setReviewing(false);
+    setReviewStatus(IDLE_STAGES);
+    setReviewCounts({});
+    setCandidates(null);
+    setReviewSummary(null);
+    setApprovedIds(new Set());
+    setReviewError(null);
+    setAppliedMessage(null);
+  }
+
   function handleLoad(saved: SavedNarration) {
     if (isGenerating) return;
     cancelRetry();
+    resetReview();
     setName(saved.name);
     setCurrentName(saved.name);
     setText(saved.text);
@@ -265,9 +406,81 @@ export default function Home() {
     setSavedList(updated);
   }
 
+  function toggleApprove(id: string) {
+    setApprovedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function selectAllApproved(selectAll: boolean) {
+    if (!candidates) return;
+    if (selectAll) {
+      setApprovedIds(
+        new Set(candidates.filter((c) => c.applicable).map((c) => c.id)),
+      );
+    } else {
+      setApprovedIds(new Set());
+    }
+  }
+
+  function applyApproved() {
+    if (!candidates) return;
+    let updated = text;
+    let applied = 0;
+    for (const c of candidates) {
+      if (!c.applicable || !approvedIds.has(c.id)) continue;
+      if (updated.includes(c.before)) {
+        updated = updated.replace(c.before, c.after);
+        applied++;
+      }
+    }
+    setText(updated);
+    if (currentName) {
+      const narration: SavedNarration = {
+        name: currentName,
+        text: updated,
+        generatedAt: new Date().toISOString(),
+        charCount: updated.length,
+      };
+      setSavedList(saveNarration(narration));
+      setLastName(currentName);
+    }
+    setCandidates(null);
+    setReviewSummary(null);
+    setReviewStatus(IDLE_STAGES);
+    setReviewCounts({});
+    setAppliedMessage(`${applied}件の修正を反映しました。`);
+  }
+
+  function dismissReview() {
+    setCandidates(null);
+    setReviewSummary(null);
+    setReviewStatus(IDLE_STAGES);
+    setReviewCounts({});
+    setAppliedMessage("修正なしで確定しました。");
+  }
+
+  function rerunReview() {
+    setAppliedMessage(null);
+    startReview(text);
+  }
+
   const charCount = text.length;
   const progress = Math.min(100, Math.round((charCount / TARGET_CHARS) * 100));
   const showDownload = isComplete && !isGenerating && text.length > 0;
+  const showReviewPanel =
+    reviewing ||
+    candidates !== null ||
+    reviewError !== null ||
+    appliedMessage !== null;
+  const showReviewButton =
+    isComplete &&
+    !isGenerating &&
+    text.length > 0 &&
+    !showReviewPanel;
 
   return (
     <main className="mx-auto max-w-3xl px-4 py-10 sm:py-14">
@@ -397,6 +610,15 @@ export default function Home() {
               >
                 {copied ? "コピーしました" : "テキストをコピー"}
               </button>
+              {showReviewButton && (
+                <button
+                  type="button"
+                  onClick={() => startReview(text)}
+                  className="rounded-lg border border-navy px-4 py-2 text-sm font-medium text-navy transition hover:bg-navy/5"
+                >
+                  校閲・品質チェック
+                </button>
+              )}
               {showDownload && (
                 <button
                   type="button"
@@ -412,6 +634,24 @@ export default function Home() {
             {text}
           </div>
         </section>
+      )}
+
+      {showReviewPanel && (
+        <ReviewPanel
+          reviewing={reviewing}
+          status={reviewStatus}
+          counts={reviewCounts}
+          candidates={candidates}
+          summary={reviewSummary}
+          approvedIds={approvedIds}
+          error={reviewError}
+          appliedMessage={appliedMessage}
+          onToggle={toggleApprove}
+          onSelectAll={selectAllApproved}
+          onApply={applyApproved}
+          onDismiss={dismissReview}
+          onRerun={rerunReview}
+        />
       )}
     </main>
   );

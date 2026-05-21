@@ -1,7 +1,17 @@
 // サーバー・フロント双方から参照する共通定数
 
-// 使用するモデル。指定どおり claude-sonnet-4-20250514 を使う。
+// 生成部（①）で使うモデル。指定どおり claude-sonnet-4-20250514 を使う。
 export const MODEL = "claude-sonnet-4-20250514";
+
+// 検査部門（②品質検査・③校閲・④ルビ検査）で使うモデル。
+// 大量の読み取りを安価にこなすため Haiku を使う。必要に応じて差し替え可。
+export const REVIEW_MODEL = "claude-haiku-4-5";
+
+// 編集判断部（⑤）で使うモデル。指摘の統合・取捨選択は精度重視で Sonnet。
+export const EDITOR_MODEL = "claude-sonnet-4-20250514";
+
+// 検査・編集判断の出力トークン上限。
+export const REVIEW_MAX_TOKENS = 8000;
 
 // 目標文字数。プログレスバーの分母にも使う。
 export const TARGET_CHARS = 40000;
