@@ -377,6 +377,11 @@ export default function Home() {
     await generateDocx(currentName, text);
   }
 
+  async function handleDownloadItem(item: SavedNarration) {
+    const { generateDocx } = await import("@/lib/generateDocx");
+    await generateDocx(item.name, item.text);
+  }
+
   function resetReview() {
     reviewAbortRef.current?.abort();
     setReviewing(false);
@@ -505,34 +510,47 @@ export default function Home() {
         {savedList.length > 0 && (
           <div className="mt-5">
             <p className="mb-2 text-xs font-medium text-gray-500">
-              生成済み偉人リスト（クリックで読み込み）
+              生成済み偉人リスト（{savedList.length}件・クリックで読み込み）
             </p>
-            <ul className="flex flex-wrap gap-2">
+            <ul className="space-y-2">
               {savedList.map((item) => (
                 <li
                   key={item.name}
-                  className="flex items-center gap-1 rounded-full border border-gray-300 bg-gray-50 py-1 pl-3 pr-1 text-sm"
+                  className="flex items-center justify-between gap-3 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2"
                 >
                   <button
                     type="button"
                     onClick={() => handleLoad(item)}
                     disabled={isGenerating}
-                    className="font-medium text-navy hover:underline disabled:cursor-not-allowed disabled:text-gray-400"
-                    title={`${item.charCount.toLocaleString()}字 / ${new Date(
-                      item.generatedAt,
-                    ).toLocaleDateString("ja-JP")}`}
+                    className="min-w-0 flex-1 text-left disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {item.name}
+                    <span className="font-medium text-navy hover:underline">
+                      {item.name}
+                    </span>
+                    <span className="ml-2 text-xs text-gray-500">
+                      {item.charCount.toLocaleString()}字 ・{" "}
+                      {new Date(item.generatedAt).toLocaleDateString("ja-JP")}
+                    </span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(item.name)}
-                    className="flex h-5 w-5 items-center justify-center rounded-full text-gray-400 transition hover:bg-gray-200 hover:text-gray-700"
-                    aria-label={`${item.name} を削除`}
-                    title="削除"
-                  >
-                    ×
-                  </button>
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => handleDownloadItem(item)}
+                      className="rounded border border-gray-300 px-2 py-1 text-xs font-medium text-gray-700 transition hover:bg-gray-100"
+                      title={`${item.name} の台本をWordで保存`}
+                    >
+                      Word
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(item.name)}
+                      className="flex h-6 w-6 items-center justify-center rounded text-gray-400 transition hover:bg-gray-200 hover:text-gray-700"
+                      aria-label={`${item.name} を削除`}
+                      title="削除"
+                    >
+                      ×
+                    </button>
+                  </div>
                 </li>
               ))}
             </ul>
